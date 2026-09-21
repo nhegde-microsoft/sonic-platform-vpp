@@ -65,8 +65,9 @@ vl_api_sonic_ext_copp_ifout_bind_t_handler (
   char name[64];
 
   snprintf (name, sizeof (name), "%s", mp->policer_name);
-  rv = sonic_ext_copp_ifout_bind (ntohs (mp->ethertype), name, mp->is_bind,
-				  mp->match_ip4_ttl_expiring);
+  rv = sonic_ext_copp_ifout_bind2 (ntohs (mp->ethertype), name, mp->is_bind,
+				   mp->match_ip4_ttl_expiring,
+				   mp->match_dhcp_broadcast);
 
   REPLY_MACRO (VL_API_SONIC_EXT_COPP_IFOUT_BIND_REPLY);
 }

@@ -62,6 +62,10 @@ define sonic_ext_copp_ifout_bind
   string policer_name[64];
   bool is_bind;
   bool match_ip4_ttl_expiring;
+  /* 0 = none (plain ethertype entry, matches pre-existing wire
+   * format), 1 = DHCP, 2 = DHCPv6. See the comment on
+   * sonic_ext_copp_ifout_entry_t.match_dhcp_broadcast in sonic_ext.h. */
+  u8 match_dhcp_broadcast;
 };
 
 define sonic_ext_copp_ifout_bind_reply

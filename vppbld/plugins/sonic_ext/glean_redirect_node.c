@@ -19,6 +19,10 @@
 #include <vnet/feature/feature.h>
 #include <vnet/adj/adj.h>
 #include <vnet/util/throttle.h>
+#include <vnet/ethernet/ethernet.h>
+#include <vnet/ip/ip4_packet.h>
+#include <vnet/ip/ip6_packet.h>
+#include <vnet/udp/udp_packet.h>
 
 /*
  * sonic-ext-glean-redirect
@@ -98,7 +102,11 @@ format_sonic_ext_glean_redirect_trace (u8 *s, va_list *args)
   _ (NO_COOKIE, "no capture cookie -- passed through")                        \
   _ (NO_LCP, "no LCP pair for ingress phy -- passed through")                 \
   _ (THROTTLED, "throttled -- passed through to drop")                        \
-  _ (DISABLED, "punt-via-member disabled -- passed through")
+  _ (DISABLED, "punt-via-member disabled -- passed through")                  \
+  _ (DHCP_REDIRECTED, "routed-port DHCP/DHCPv6 broadcast redirected to "      \
+		      "copp-ifout for policing")                              \
+  _ (DHCP_NOT_BOUND, "DHCP/DHCPv6 broadcast matched but no copp-ifout "       \
+		     "entry bound -- passed through to drop")
 
 typedef enum
 {
@@ -117,6 +125,7 @@ static char *sonic_ext_glean_redirect_error_strings[] = {
 typedef enum
 {
   SONIC_EXT_GLEAN_REDIRECT_NEXT_INTERFACE_OUTPUT,
+  SONIC_EXT_GLEAN_REDIRECT_NEXT_COPP_IFOUT,
   SONIC_EXT_GLEAN_REDIRECT_N_NEXT,
 } sonic_ext_glean_redirect_next_t;
 
@@ -238,6 +247,101 @@ sonic_ext_glean_should_redirect (u32 adj_index)
   return 1;
 }
 
+/*
+ * Routed-port DHCP/DHCPv6 client-broadcast detection.
+ *
+ * DHCP client broadcast (dst=255.255.255.255) and DHCPv6 client
+ * multicast (dst=ff02::1:2) have no FIB route on a routed port. So
+ * ip4-lookup/ip6-(m)fib-lookup hands the packet straight to ip4-drop /
+ * ip6-drop. That is a different drop reason than the unresolved-neighbour
+ * case this node was originally written for. So it is checked independently.
+ *
+ * On a bridge (Vlan) member this traffic is intercepted earlier, at
+ * l2-input-classify and never reaches ip4-drop/ip6-drop.
+ *
+ * Returns 1 (v4) / 2 (v6) if this is a DHCP client-broadcast frame,
+ * else 0. 
+ */
+#define SONIC_EXT_DHCP_UDP_DPORT 67
+#define SONIC_EXT_DHCPV6_UDP_DPORT 547
+
+static_always_inline int
+sonic_ext_glean_is_dhcp_broadcast (vlib_buffer_t *b)
+{
+  sonic_ext_buffer_opaque_t *seb = sonic_ext_buffer (b);
+  ethernet_header_t *eth;
+  u16 ethertype;
+  i32 l2_off;
+
+  if (seb->magic != SONIC_EXT_BUFFER_MAGIC)
+    return 0;
+
+  l2_off = (i32) vnet_buffer (b)->l2_hdr_offset - (i32) b->current_data;
+  eth = (ethernet_header_t *) (vlib_buffer_get_current (b) + l2_off);
+  if ((u8 *) eth < b->data || (u8 *) eth + sizeof (*eth) >
+      b->data + b->current_data + b->current_length)
+    return 0;
+
+  ethertype = clib_net_to_host_u16 (eth->type);
+
+  if (ethertype == ETHERNET_TYPE_IP4)
+    {
+      ip4_header_t *ip4 = (ip4_header_t *) (eth + 1);
+      udp_header_t *udp;
+
+      if ((u8 *) (ip4 + 1) >
+	  b->data + b->current_data + b->current_length)
+	return 0;
+      if (ip4->protocol != IP_PROTOCOL_UDP)
+	return 0;
+      if (ip4->dst_address.as_u32 != 0xffffffff) /* 255.255.255.255 */
+	return 0;
+
+      udp = (udp_header_t *) (ip4 + 1);
+      if ((u8 *) (udp + 1) > b->data + b->current_data + b->current_length)
+	return 0;
+      if (clib_net_to_host_u16 (udp->dst_port) != SONIC_EXT_DHCP_UDP_DPORT)
+	return 0;
+
+      return 1;
+    }
+
+  if (ethertype == ETHERNET_TYPE_IP6)
+    {
+      ip6_header_t *ip6 = (ip6_header_t *) (eth + 1);
+      udp_header_t *udp;
+
+      if ((u8 *) (ip6 + 1) >
+	  b->data + b->current_data + b->current_length)
+	return 0;
+      /* DHCPv6 client multicast is always plain UDP directly after the
+       * fixed IPv6 header in this test/traffic shape -- no extension
+       * headers to walk. */
+      if (ip6->protocol != IP_PROTOCOL_UDP)
+	return 0;
+      /* ff02::1:2 (All_DHCP_Relay_Agents_and_Servers) */
+      if (ip6->dst_address.as_u16[0] != clib_host_to_net_u16 (0xff02) ||
+	  ip6->dst_address.as_u16[1] != 0 || ip6->dst_address.as_u16[2] != 0 ||
+	  ip6->dst_address.as_u16[3] != 0 || ip6->dst_address.as_u16[4] != 0 ||
+	  ip6->dst_address.as_u16[5] != 0 ||
+	  ip6->dst_address.as_u16[6] != clib_host_to_net_u16 (0x0001) ||
+	  ip6->dst_address.as_u16[7] != clib_host_to_net_u16 (0x0002))
+	return 0;
+
+      udp = (udp_header_t *) (ip6 + 1);
+      if ((u8 *) (udp + 1) > b->data + b->current_data + b->current_length)
+	return 0;
+      if (clib_net_to_host_u16 (udp->dst_port) != SONIC_EXT_DHCPV6_UDP_DPORT)
+	return 0;
+
+      return 2;
+    }
+
+  return 0;
+}
+
+static u8 sonic_ext_glean_ifout_arc_index = (u8) ~0;
+
 VLIB_NODE_FN (sonic_ext_glean_redirect_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
@@ -248,7 +352,12 @@ VLIB_NODE_FN (sonic_ext_glean_redirect_node)
   u16 nexts[VLIB_FRAME_SIZE], *next;
   u32 n_redirected = 0, n_not_glean = 0, n_no_cookie = 0, n_no_lcp = 0;
   u32 n_throttled = 0, n_disabled = 0, n_not_nbr_node = 0;
+  u32 n_dhcp_redirected = 0, n_dhcp_not_bound = 0;
   u64 seed;
+
+  if (PREDICT_FALSE (sonic_ext_glean_ifout_arc_index == (u8) ~0))
+    sonic_ext_glean_ifout_arc_index =
+      vnet_get_feature_arc_index ("interface-output");
 
   seed = throttle_seed (&sonic_ext_glean_throttle, thread_index,
 			vlib_time_now (vm));
@@ -284,7 +393,8 @@ VLIB_NODE_FN (sonic_ext_glean_redirect_node)
       /* Only steal packets a neighbour-resolution node dropped, and
        * only when their VLIB_TX adjacency really is an unresolved
        * connected (glean) or incomplete (arp) adjacency.  Every other
-       * ip4-drop / ip6-drop reason falls straight through.
+       * ip4-drop / ip6-drop reason falls through to the DHCP check
+       * below instead of straight to trace0/drop.
        *
        * The node gate has to come first: on any other drop path
        * adj_index[VLIB_TX] is not an adjacency index at all (see the
@@ -293,13 +403,13 @@ VLIB_NODE_FN (sonic_ext_glean_redirect_node)
       if (!sonic_ext_glean_from_nbr_node (vm, b[0]))
 	{
 	  n_not_nbr_node++;
-	  goto trace0;
+	  goto dhcp_check;
 	}
 
       if (!sonic_ext_glean_should_redirect (adj_index0))
 	{
 	  n_not_glean++;
-	  goto trace0;
+	  goto dhcp_check;
 	}
 
       seb = sonic_ext_buffer (b[0]);
@@ -330,6 +440,59 @@ VLIB_NODE_FN (sonic_ext_glean_redirect_node)
       next[0] = SONIC_EXT_GLEAN_REDIRECT_NEXT_INTERFACE_OUTPUT;
       did_redirect = 1;
       n_redirected++;
+      goto trace0;
+
+    dhcp_check:
+      /* Not a glean/arp neighbour-resolution drop -- check for the
+       * other drop reason this node handles: a routed-port DHCP/
+       * DHCPv6 client broadcast with no FIB route.
+      {
+	int dhcp_v6 = sonic_ext_glean_is_dhcp_broadcast (b[0]);
+
+	if (!dhcp_v6)
+	  goto trace0;
+
+	seb = sonic_ext_buffer (b[0]);
+	orig_rx = seb->orig_rx_sw_if_index;
+
+	if (PREDICT_FALSE (!sonic_ext_redirect_to_ingress_tap (
+	      b[0], orig_rx, ~0, &host_tap, &pushed_tpid, &pushed_vlan_id)))
+	  {
+	    n_no_lcp++;
+	    goto trace0;
+	  }
+
+	{
+	  int ifout_idx =
+	    sonic_ext_copp_ifout_find_dhcp_entry (sem, dhcp_v6 == 2);
+
+	  if (ifout_idx < 0)
+	    {
+	      /* Not bound (no SAI trap for dhcp/dhcpv6 installed) --
+	       * this DUT has no policer configured for this trap;
+	       * proceed to the real drop, matching pre-fix behaviour. */
+	      n_dhcp_not_bound++;
+	      goto trace0;
+	    }
+
+	  sonic_ext_buffer (b[0])->copp_ifout_entry_idx = (u32) ifout_idx;
+	  /* sonic_ext_redirect_to_ingress_tap() clears the magic cookie as
+	   * part of its own contract, but sonic-ext-copp-ifout's check requires
+	   * the cookie to still read as valid to trust copp_ifout_entry_idx. */
+	  sonic_ext_buffer (b[0])->magic = SONIC_EXT_BUFFER_MAGIC;
+	}
+
+	{
+	  u32 dummy_next;
+	  vnet_feature_arc_start (sonic_ext_glean_ifout_arc_index, host_tap,
+				   &dummy_next, b[0]);
+	}
+
+	next[0] = SONIC_EXT_GLEAN_REDIRECT_NEXT_COPP_IFOUT;
+	did_redirect = 1;
+	n_dhcp_redirected++;
+	goto trace0;
+      }
 
     trace0:
       if (PREDICT_FALSE ((node->flags & VLIB_NODE_FLAG_TRACE) &&
@@ -361,6 +524,8 @@ VLIB_NODE_FN (sonic_ext_glean_redirect_node)
   _inc (NO_LCP, n_no_lcp);
   _inc (THROTTLED, n_throttled);
   _inc (DISABLED, n_disabled);
+  _inc (DHCP_REDIRECTED, n_dhcp_redirected);
+  _inc (DHCP_NOT_BOUND, n_dhcp_not_bound);
 #undef _inc
 
   sem->glean_redirects += n_redirected;
@@ -377,6 +542,7 @@ VLIB_REGISTER_NODE (sonic_ext_glean_redirect_node) = {
   .n_next_nodes = SONIC_EXT_GLEAN_REDIRECT_N_NEXT,
   .next_nodes = {
     [SONIC_EXT_GLEAN_REDIRECT_NEXT_INTERFACE_OUTPUT] = "interface-output",
+    [SONIC_EXT_GLEAN_REDIRECT_NEXT_COPP_IFOUT] = "sonic-ext-copp-ifout",
   },
 };
 

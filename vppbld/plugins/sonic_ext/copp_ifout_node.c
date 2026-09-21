@@ -159,6 +159,12 @@ sonic_ext_copp_ifout_x1 (vlib_main_t *vm, sonic_ext_main_t *sem,
       if (!cand->in_use || cand->ethertype != ethertype)
 	continue;
 
+      /* DHCP/DHCPv6 entries are handled by the pre-resolved
+       * seb->copp_ifout_entry_idx handoff above, set by
+       * sonic-ext-glean-redirect. */
+      if (cand->match_dhcp_broadcast)
+	continue;
+
       if (cand->match_ip4_ttl_expiring)
 	{
 	  ip4_header_t *ip4;
@@ -357,7 +363,27 @@ sonic_ext_copp_ifout_find_entry (sonic_ext_main_t *sem, u16 ethertype)
   for (u32 i = 0; i < sem->copp_ifout_n_entries; i++)
     {
       if (sem->copp_ifout_entries[i].in_use &&
-	  sem->copp_ifout_entries[i].ethertype == ethertype)
+	  sem->copp_ifout_entries[i].ethertype == ethertype &&
+	  !sem->copp_ifout_entries[i].match_dhcp_broadcast)
+	return (int) i;
+    }
+  return -1;
+}
+
+/*
+ * Find a DHCP (dhcp_v6==0) or DHCPv6 (dhcp_v6!=0) entry by its
+ * dedicated match flag rather than by ethertype. Used by
+ * sonic-ext-glean-redirect to pre-resolve the entry before handing off
+ * to sonic-ext-copp-ifout.
+ */
+int
+sonic_ext_copp_ifout_find_dhcp_entry (sonic_ext_main_t *sem, int dhcp_v6)
+{
+  u8 want = dhcp_v6 ? 2 : 1;
+  for (u32 i = 0; i < sem->copp_ifout_n_entries; i++)
+    {
+      if (sem->copp_ifout_entries[i].in_use &&
+	  sem->copp_ifout_entries[i].match_dhcp_broadcast == want)
 	return (int) i;
     }
   return -1;
@@ -367,8 +393,25 @@ int
 sonic_ext_copp_ifout_bind (u16 ethertype, const char *policer_name,
 			   int is_bind, int match_ip4_ttl_expiring)
 {
+  return sonic_ext_copp_ifout_bind2 (ethertype, policer_name, is_bind,
+				     match_ip4_ttl_expiring, 0);
+}
+
+int
+sonic_ext_copp_ifout_bind2 (u16 ethertype, const char *policer_name,
+			    int is_bind, int match_ip4_ttl_expiring,
+			    int match_dhcp_broadcast)
+{
   sonic_ext_main_t *sem = &sonic_ext_main;
-  int idx = sonic_ext_copp_ifout_find_entry (sem, ethertype);
+  int idx;
+
+  /* DHCP/DHCPv6 entries are looked up by their dedicated flag, not by
+   * ethertype (see sonic_ext_copp_ifout_entry_t.match_dhcp_broadcast) --
+   * an ethertype-only lookup would collide with the TTL_ERROR/plain-IP
+   * entry sharing the same ethertype. */
+  idx = match_dhcp_broadcast ?
+    sonic_ext_copp_ifout_find_dhcp_entry (sem, match_dhcp_broadcast == 2) :
+    sonic_ext_copp_ifout_find_entry (sem, ethertype);
 
   if (!is_bind)
     {
@@ -398,6 +441,8 @@ sonic_ext_copp_ifout_bind (u16 ethertype, const char *policer_name,
   sem->copp_ifout_entries[idx].in_use = 1;
   sem->copp_ifout_entries[idx].match_ip4_ttl_expiring =
     match_ip4_ttl_expiring ? 1 : 0;
+  sem->copp_ifout_entries[idx].match_dhcp_broadcast =
+    (u8) match_dhcp_broadcast;
   sem->copp_ifout_conform_packets[idx] = 0;
   sem->copp_ifout_exceed_packets[idx] = 0;
   sem->copp_ifout_violate_packets[idx] = 0;

@@ -112,6 +112,7 @@ typedef struct
   u32 policer_index;
   u8 in_use;
   u8 match_ip4_ttl_expiring; /* TTL_ERROR trap */
+  u8 match_dhcp_broadcast;  /* 0 = none, 1 = DHCP (v4), 2 = DHCPv6 */
 } sonic_ext_copp_ifout_entry_t;
 
 #define SONIC_EXT_COPP_IP2ME_MAX_ADDRS 256
@@ -266,10 +267,25 @@ void sonic_ext_copp_ifout_enable_disable (u32 sw_if_index, int enable);
 int sonic_ext_copp_ifout_find_entry (sonic_ext_main_t *sem, u16 ethertype);
 
 /*
+ * look up the DHCP (dhcp_v6==0) or DHCPv6 (dhcp_v6!=0) entry by its
+ * dedicated match flag. Returns -1 if not bound.
+ */
+int sonic_ext_copp_ifout_find_dhcp_entry (sonic_ext_main_t *sem, int dhcp_v6);
+
+/*
  * bind (or unbind) an ethertype -> policer-name
  */
 int sonic_ext_copp_ifout_bind (u16 ethertype, const char *policer_name,
 			       int is_bind, int match_ip4_ttl_expiring);
+
+/*
+ * bind (or unbind) a DHCP/DHCPv6 entry: match_dhcp_broadcast is
+ * 0=plain ethertype entry (same as sonic_ext_copp_ifout_bind), 1=DHCP,
+ * 2=DHCPv6.
+ */
+int sonic_ext_copp_ifout_bind2 (u16 ethertype, const char *policer_name,
+				int is_bind, int match_ip4_ttl_expiring,
+				int match_dhcp_broadcast);
 int sonic_ext_copp_ip2me_addr_add_del (u32 addr, int is_add);
 int sonic_ext_copp_ip2me_bind (const char *policer_name, int is_bind);
 int sonic_ext_copp_ip2me_bind_bgp (const char *policer_name, int is_bind);
